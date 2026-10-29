@@ -48,3 +48,28 @@ def top_keywords_per_class(model, n: int = 8) -> pd.DataFrame:
         coefs = clf.coef_[i] if len(clf.classes_) > 2 else clf.coef_[0] * (1 if i == 1 else -1)
         rows[cls] = list(terms[np.argsort(coefs)[::-1][:n]])
     return pd.DataFrame(rows)
+
+
+def compare_models(df: pd.DataFrame, cv: int = 5, seed: int = 42) -> pd.DataFrame:
+    """Cross-validated comparison of several classifiers on the same TF-IDF features."""
+    from sklearn.model_selection import StratifiedKFold, cross_validate
+    from sklearn.naive_bayes import MultinomialNB
+    from sklearn.svm import LinearSVC
+
+    models = {
+        "Logistic Regression": LogisticRegression(max_iter=1000),
+        "Naive Bayes": MultinomialNB(),
+        "Linear SVM": LinearSVC(),
+    }
+    cv = max(2, min(cv, int(df["category"].value_counts().min())))
+    splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=seed)
+    rows = []
+    for name, est in models.items():
+        pipe = Pipeline([("tfidf", TfidfVectorizer(stop_words="english", ngram_range=(1, 2), sublinear_tf=True)),
+                         ("clf", est)])
+        res = cross_validate(pipe, df["text"], df["category"], cv=splitter,
+                             scoring=["accuracy", "f1_macro"])
+        rows.append({"Model": name,
+                     "Accuracy": res["test_accuracy"].mean(), "Accuracy std": res["test_accuracy"].std(),
+                     "F1 (macro)": res["test_f1_macro"].mean()})
+    return pd.DataFrame(rows).set_index("Model").round(4).sort_values("Accuracy", ascending=False)

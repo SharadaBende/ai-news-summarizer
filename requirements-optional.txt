@@ -1,0 +1,3 @@
+# Only needed for the abstractive (transformer) summarizer. Large download (~2 GB).
+transformers
+torch

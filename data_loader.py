@@ -54,3 +54,15 @@ def fetch_rss(url: str, limit: int = 15) -> pd.DataFrame:
             "published": entry.get("published", ""),
         })
     return pd.DataFrame(rows)
+
+
+def load_reference_csv(path_or_buffer, text_col: str = "text", ref_col: str = "reference") -> pd.DataFrame:
+    """Load articles with human reference summaries (e.g. CNN/DailyMail: article, highlights)."""
+    df = pd.read_csv(path_or_buffer)
+    missing = [c for c in (text_col, ref_col) if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns {missing}. Found: {list(df.columns)}")
+    df = df.rename(columns={text_col: "text", ref_col: "reference"}).dropna(subset=["text", "reference"])
+    df["text"] = df["text"].map(clean_text)
+    df["reference"] = df["reference"].map(clean_text)
+    return df.reset_index(drop=True)

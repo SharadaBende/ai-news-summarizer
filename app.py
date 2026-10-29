@@ -5,8 +5,11 @@ import seaborn as sns
 import streamlit as st
 
 import classifier as clf
+import clustering
 import data_loader as dl
+import evaluation as ev
 import summarizer as sm
+import transformer_summarizer as ts
 
 st.set_page_config(page_title="AI News Summarizer", page_icon="📰", layout="wide")
 sns.set_theme(style="whitegrid")
@@ -23,6 +26,16 @@ def get_model(df: pd.DataFrame):
     return clf.train(df)
 
 
+@st.cache_data(show_spinner="Comparing models…")
+def get_comparison(df: pd.DataFrame):
+    return clf.compare_models(df)
+
+
+@st.cache_data(show_spinner="Clustering…")
+def get_clusters(df: pd.DataFrame):
+    return clustering.cluster_articles(df)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_feed(url: str, limit: int):
     return dl.fetch_rss(url, limit)
@@ -30,6 +43,9 @@ def get_feed(url: str, limit: int):
 
 # ---------- sidebar ----------
 st.sidebar.title("📰 AI News Summarizer")
+method = st.sidebar.radio("Summarization method",
+                          ["Extractive (TextRank)", "Abstractive (Transformer)"],
+                          help="Abstractive needs `pip install -r requirements-optional.txt` and internet for the first download.")
 n_sent = st.sidebar.slider("Summary length (sentences)", 1, 8, 3)
 n_kw = st.sidebar.slider("Number of keywords", 3, 15, 8)
 st.sidebar.markdown("---")
@@ -44,15 +60,30 @@ st.sidebar.caption(f"{len(df)} articles • {df['category'].nunique()} categorie
 
 model, metrics = get_model(df)
 
-tab1, tab2, tab3 = st.tabs(["✍️ Summarize", "📡 Live news (RSS)", "📊 Model & data insights"])
+tab1, tab2, tab3, tab4 = st.tabs(["✍️ Summarize", "📡 Live news (RSS)",
+                                  "🧪 Summary evaluation (ROUGE)", "📊 Model & data insights"])
 
 
 # ---------- shared renderer ----------
 def show_result(text: str):
-    summary, scores = sm.summarize(text, n_sent, return_scores=True)
-    stats = sm.compression_stats(text, summary)
     label, probs = clf.predict(model, text)
+    scores, summary = None, None
 
+    if method.startswith("Abstractive"):
+        if not ts.is_available():
+            st.warning("Transformers/torch not installed - falling back to extractive. "
+                       "Run `pip install -r requirements-optional.txt` to enable this option.")
+        else:
+            try:
+                with st.spinner("Running transformer model (first run downloads it)…"):
+                    abstract = ts.summarize_abstractive(text)
+                summary = [abstract]
+            except Exception as e:
+                st.error(f"Transformer failed ({e}). Falling back to extractive.")
+    if summary is None:
+        summary, scores = sm.summarize(text, n_sent, return_scores=True)
+
+    stats = sm.compression_stats(text, summary)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Predicted category", label.title())
     c2.metric("Original words", stats["original_words"])
@@ -62,7 +93,6 @@ def show_result(text: str):
     st.subheader("Summary")
     for s in summary:
         st.markdown(f"- {s}")
-
     st.markdown("**Keywords:** " + " ".join(f"`{k}`" for k in sm.extract_keywords(text, n_kw)))
 
     col_a, col_b = st.columns(2)
@@ -70,16 +100,14 @@ def show_result(text: str):
         fig, ax = plt.subplots(figsize=(5, 3))
         p = pd.Series(probs).sort_values()
         sns.barplot(x=p.values, y=p.index, ax=ax, color="#4C78A8")
-        ax.set_xlabel("Probability"); ax.set_ylabel("")
-        ax.set_title("Category confidence")
+        ax.set_xlabel("Probability"); ax.set_ylabel(""); ax.set_title("Category confidence")
         st.pyplot(fig)
     with col_b:
         sents = sm.split_sentences(text)
-        if len(scores) == len(sents) and len(sents) > 1:
+        if scores is not None and len(scores) == len(sents) and len(sents) > 1:
             fig, ax = plt.subplots(figsize=(5, 3))
             chosen = set(summary)
-            colors = ["#F58518" if s in chosen else "#BBBBBB" for s in sents]
-            ax.bar(range(1, len(sents) + 1), scores, color=colors)
+            ax.bar(range(1, len(sents) + 1), scores, color=["#F58518" if s in chosen else "#BBBBBB" for s in sents])
             ax.set_xlabel("Sentence #"); ax.set_ylabel("Importance")
             ax.set_title("Sentence importance (orange = in summary)")
             st.pyplot(fig)
@@ -130,14 +158,56 @@ with tab2:
         st.info("No articles returned for that feed.")
 
 
-# ---------- tab 3 ----------
+# ---------- tab 3: ROUGE ----------
 with tab3:
+    st.header("How good are the summaries?")
+    st.write("Compares our TextRank summarizer against two baselines using **ROUGE** "
+             "(word overlap with human-written reference summaries).")
+    src = st.radio("Reference data", ["Built-in demo (5 articles)", "Upload CSV with reference summaries"], horizontal=True)
+    refs = None
+    if src.startswith("Built-in"):
+        refs = dl.load_reference_csv("data/sample_references.csv")
+        st.info("Demo only: 5 articles is far too few for meaningful scores. Upload e.g. the CNN/DailyMail CSV "
+                "(`article` + `highlights` columns) for a real evaluation.")
+    else:
+        up = st.file_uploader("CSV file", type="csv", key="ref_upload")
+        if up is not None:
+            raw = pd.read_csv(up)
+            c1, c2 = st.columns(2)
+            tcol = c1.selectbox("Article text column", raw.columns)
+            rcol = c2.selectbox("Reference summary column", raw.columns, index=min(1, len(raw.columns) - 1))
+            up.seek(0)
+            try:
+                refs = dl.load_reference_csv(up, tcol, rcol)
+            except Exception as e:
+                st.error(str(e))
+    if refs is not None:
+        c1, c2 = st.columns(2)
+        n_eval = c1.slider("Sentences per summary", 1, 6, 3, key="n_eval")
+        if len(refs) > 5:
+            max_rows = c2.slider("Max articles to evaluate", 5, min(len(refs), 1000),
+                                 min(len(refs), 200), key="max_rows")
+        else:
+            max_rows = len(refs)
+            c2.caption(f"Using all {len(refs)} articles.")
+        if st.button("Run evaluation", type="primary"):
+            with st.spinner("Scoring…"):
+                res = ev.evaluate(refs, n_sentences=n_eval, max_rows=max_rows)
+            st.dataframe(res, use_container_width=True)
+            plot = res[["ROUGE-1", "ROUGE-2", "ROUGE-L"]].reset_index().melt("System", var_name="Metric", value_name="F1")
+            fig, ax = plt.subplots(figsize=(7, 3.5))
+            sns.barplot(data=plot, x="Metric", y="F1", hue="System", ax=ax)
+            ax.set_title(f"ROUGE F1 on {min(len(refs), max_rows)} articles")
+            st.pyplot(fig)
+
+
+# ---------- tab 4: insights ----------
+with tab4:
     st.header("Dataset overview")
     c1, c2 = st.columns(2)
     with c1:
         fig, ax = plt.subplots(figsize=(5, 3.5))
-        order = df["category"].value_counts().index
-        sns.countplot(data=df, y="category", order=order, ax=ax, color="#4C78A8")
+        sns.countplot(data=df, y="category", order=df["category"].value_counts().index, ax=ax, color="#4C78A8")
         ax.set_title("Articles per category"); ax.set_ylabel("")
         st.pyplot(fig)
     with c2:
@@ -148,7 +218,7 @@ with tab3:
 
     st.header("Classifier performance")
     m1, m2, m3 = st.columns(3)
-    m1.metric("Test accuracy", f"{metrics['accuracy']:.1%}")
+    m1.metric("Hold-out accuracy", f"{metrics['accuracy']:.1%}")
     m2.metric("Training articles", metrics["n_train"])
     m3.metric("Test articles", metrics["n_test"])
 
@@ -166,6 +236,32 @@ with tab3:
         st.subheader("Precision / recall / F1")
         st.dataframe(metrics["report"].round(2), use_container_width=True)
 
+    st.header("Model comparison (cross-validated)")
+    comp = get_comparison(df)
+    c5, c6 = st.columns([1, 1])
+    c5.dataframe(comp, use_container_width=True)
+    with c6:
+        fig, ax = plt.subplots(figsize=(5, 3))
+        sns.barplot(x=comp["Accuracy"], y=comp.index, xerr=comp["Accuracy std"], ax=ax, color="#4C78A8")
+        ax.set_xlim(0, 1.05); ax.set_ylabel(""); ax.set_title("CV accuracy (± std)")
+        st.pyplot(fig)
+
+    st.header("Topic clustering (KMeans, unsupervised)")
+    cl = get_clusters(df)
+    st.metric("Adjusted Rand Index vs true categories", f"{cl['ari']:.2f}",
+              help="1.0 = clusters perfectly match the real categories, 0 = random.")
+    c7, c8 = st.columns(2)
+    with c7:
+        fig, ax = plt.subplots(figsize=(5, 4))
+        sns.scatterplot(x=cl["coords"][:, 0], y=cl["coords"][:, 1], hue=df["category"], style=cl["labels"].astype(str),
+                        ax=ax, s=60)
+        ax.set_title("Articles in 2-D (colour = true category, marker = cluster)")
+        ax.legend(fontsize=6, loc="best")
+        st.pyplot(fig)
+    with c8:
+        st.subheader("Top terms per cluster")
+        st.dataframe(cl["cluster_terms"], use_container_width=True)
+
     if len(df) < 200:
-        st.info("The built-in dataset is tiny, so accuracy numbers are only illustrative. "
-                "Upload the BBC News CSV (rename columns to `text` and `category`) for realistic results.")
+        st.info("The built-in dataset is tiny, so these numbers are only illustrative. "
+                "Upload the BBC News CSV (`bbc-text.csv`, already has `category` and `text` columns) for realistic results.")
